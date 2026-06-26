@@ -1,0 +1,150 @@
+name: Update NPM Dependencies
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Runs every Monday at midnight UTC
+  workflow_dispatch:     # Allows manual triggering
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check and update dependencies
+        id: update_deps
+        run: |
+          echo "Reading package.json..."
+          PACKAGE_JSON="package.json"
+
+          # Extract dependency names and current versions
+          DEPS=$(node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('$PACKAGE_JSON', 'utf8'));
+            const deps = pkg.dependencies || {};
+            Object.entries(deps).forEach(([name, version]) => {
+              console.log(name + '=' + version);
+            });
+          ")
+
+          UPDATED=false
+          SUMMARY=""
+
+          for DEP in $DEPS; do
+            PKG_NAME="${DEP%%=*}"
+            CURRENT_VERSION="${DEP##*=}"
+
+            # Strip semver range prefixes (^, ~, >=, etc.)
+            CLEAN_CURRENT=$(echo "$CURRENT_VERSION" | sed 's/[^0-9.]//g')
+
+            echo "Checking $PKG_NAME (current: $CLEAN_CURRENT)..."
+
+            # Fetch latest version from npm registry
+            LATEST_VERSION=$(curl -sf "https://registry.npmjs.org/$PKG_NAME/latest" | node -e "
+              let data = '';
+              process.stdin.on('data', chunk => data += chunk);
+              process.stdin.on('end', () => {
+                try {
+                  const json = JSON.parse(data);
+                  console.log(json.version || '');
+                } catch {
+                  console.log('');
+                }
+              });
+            ")
+
+            if [ -z "$LATEST_VERSION" ]; then
+              echo "  ⚠️  Could not fetch latest version for $PKG_NAME, skipping."
+              continue
+            fi
+
+            echo "  Latest: $LATEST_VERSION"
+
+            # Compare versions using Node.js semver-aware comparison
+            NEEDS_UPDATE=$(node -e "
+              function parseVer(v) {
+                return v.split('.').map(Number);
+              }
+              function isOlder(current, latest) {
+                const c = parseVer(current);
+                const l = parseVer(latest);
+                for (let i = 0; i < 3; i++) {
+                  const cv = c[i] || 0;
+                  const lv = l[i] || 0;
+                  if (cv < lv) return true;
+                  if (cv > lv) return false;
+                }
+                return false;
+              }
+              const current = '$CLEAN_CURRENT';
+              const latest = '$LATEST_VERSION';
+              console.log(isOlder(current, latest) ? 'yes' : 'no');
+            ")
+
+            if [ "$NEEDS_UPDATE" = "yes" ]; then
+              echo "  ✅ Updating $PKG_NAME: $CLEAN_CURRENT → $LATEST_VERSION"
+
+              # Preserve the original range prefix (^, ~, etc.)
+              PREFIX=$(echo "$CURRENT_VERSION" | grep -oP '^[^0-9]*')
+              NEW_VERSION="${PREFIX}${LATEST_VERSION}"
+
+              # Update package.json in-place
+              node -e "
+                const fs = require('fs');
+                const pkg = JSON.parse(fs.readFileSync('$PACKAGE_JSON', 'utf8'));
+                if (pkg.dependencies && pkg.dependencies['$PKG_NAME']) {
+                  pkg.dependencies['$PKG_NAME'] = '$NEW_VERSION';
+                }
+                fs.writeFileSync('$PACKAGE_JSON', JSON.stringify(pkg, null, 2) + '\n');
+              "
+
+              SUMMARY="${SUMMARY}\n- \`$PKG_NAME\`: \`$CURRENT_VERSION\` → \`$NEW_VERSION\`"
+              UPDATED=true
+            else
+              echo "  — $PKG_NAME is up to date."
+            fi
+          done
+
+          # Export results for later steps
+          echo "updated=$UPDATED" >> $GITHUB_OUTPUT
+          {
+            echo "summary<<EOF"
+            echo -e "$SUMMARY"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create Pull Request
+        if: steps.update_deps.outputs.updated == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(deps): update npm dependencies to latest versions"
+          branch: "chore/update-npm-dependencies"
+          delete-branch: true
+          title: "chore(deps): update npm dependencies"
+          body: |
+            ## 📦 Dependency Updates
+
+            The following `dependencies` in `package.json` have been updated to their latest versions from [npmjs.com](https://www.npmjs.com/):
+
+            ${{ steps.update_deps.outputs.summary }}
+
+            ---
+            > This PR was automatically generated by the **Update NPM Dependencies** workflow.
+          labels: |
+            dependencies
+            automated
+
+      - name: No updates needed
+        if: steps.update_deps.outputs.updated == 'false'
+        run: echo "✅ All dependencies are already up to date. No PR created."
